@@ -12,3 +12,6 @@ test.py has a little gui to view the images in real time. Make sure you forward 
 use `ssh -X <hostname>`
 
 ![image](https://github.com/user-attachments/assets/7c82abc6-4dbe-4290-86f6-842a539987e5)
+
+# Saving uncompressed data
+flir8k.c now saves uncompressed thermal data as PPM and PGM files. these are saved in a circular buffer to /mnt/RAMDisk
