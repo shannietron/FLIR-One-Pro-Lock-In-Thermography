@@ -10,3 +10,5 @@ Credit goes to tomas123, cynfab etc from EEVBLOG for deciphering the USB Protoco
 The C driver saves thermal.jpg and real.jpg to /mnt/RAMDisk
 test.py has a little gui to view the images in real time. Make sure you forward your X11 to see the GUI
 use `ssh -X <hostname>`
+
+![image](https://github.com/user-attachments/assets/7c82abc6-4dbe-4290-86f6-842a539987e5)
