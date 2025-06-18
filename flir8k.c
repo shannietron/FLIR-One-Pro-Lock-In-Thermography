@@ -5,569 +5,569 @@
 #include <libusb.h>
 #include <unistd.h>
 #include <time.h>
-
 #include <fcntl.h>
 #include <math.h>
+#include <termios.h>
+#include <sys/stat.h>
+#include <pthread.h>
+#include <signal.h>
 
 #include "jpeglib.h"
 #include "Palettes.h"
 
-// define a ramdisk folder of 20MB for jpeg images
-// $ sudo mkdir /mnt/RAMDisk
-// $ sudo chmod 777 /mnt/RAMDisk
-// $ sudo mount -t tmpfs  -o size=20m none  /mnt/RAMDisk
-#define RAMDISKPATH "/mnt/RAMDisk/"
-#define MAX_FILES 100
-static int file_index = 0;
-
+// FLIR camera definitions
 #define VENDOR_ID 0x09cb
 #define PRODUCT_ID 0x1996
+#define RAMDISKPATH "/mnt/RAMDisk/"
 
+// Power supply control
+typedef struct {
+	int serial_fd;
+	double frequency;
+	double voltage;
+	double current;
+	int modulation_active;
+	int cycle_count;
+	struct timeval start_time;
+	char current_state[16];  // "ON", "OFF", "INIT"
+} power_supply_t;
+
+// Global variables
 static struct libusb_device_handle *devh = NULL;
-int filecount=0;
-struct timeval t1, t2;
-long long fps_t;
+static power_supply_t ps = {-1, 0.5, 5.0, 0.1, 0, 0, {0}, "INIT"};
+static int file_index = 0;
+static int filecount = 0;
+static struct timeval t1, t2;
+static long long fps_t;
+static int buf85pointer = 0;
+static unsigned char buf85[1048576];
+static volatile int acquisition_running = 1;
+static char output_dir[256] = "";  // For copying files out of RAMDisk
+static volatile int cleanup_in_progress = 0;  // Prevent double cleanup
+static volatile int force_exit_counter = 0;   // Count Ctrl+C presses
 
+// Function prototypes
+int init_power_supply(const char* device, double voltage, double current);
+void start_modulation(double frequency);
+void* modulation_thread(void* arg);
+void get_current_power_state(char *state_str, int *cycle_num);
+void cleanup_and_exit(int sig);
 
-// -- buffer for EP 0x85 chunks ---------------
-#define BUF85SIZE 1048576   // size got from android app
-int buf85pointer = 0;
-unsigned char buf85[BUF85SIZE];
+int init_power_supply(const char* device, double voltage, double current) {
+	printf("Initializing power supply: %s\n", device);
 
-void vframe(char ep[],char EP_error[], int r, int actual_length, unsigned char buf[]) 
-{
-	// error handler
+	ps.serial_fd = open(device, O_RDWR | O_NOCTTY);
+	if (ps.serial_fd < 0) {
+		fprintf(stderr, "Failed to open power supply device: %s (%s)\n", device, strerror(errno));
+		return -1;
+	}
+
+	// Configure serial port for Korad power supply
+	struct termios tty;
+	tcgetattr(ps.serial_fd, &tty);
+
+	// Set baud rate to 9600
+	cfsetospeed(&tty, B9600);
+	cfsetispeed(&tty, B9600);
+
+	// Configure 8N1
+	tty.c_cflag |= (CLOCAL | CREAD);    // Enable receiver, local mode
+	tty.c_cflag &= ~PARENB;             // No parity
+	tty.c_cflag &= ~CSTOPB;             // 1 stop bit
+	tty.c_cflag &= ~CSIZE;              // Clear size bits
+	tty.c_cflag |= CS8;                 // 8 data bits
+
+	// Disable flow control
+	tty.c_cflag &= ~CRTSCTS;
+	tty.c_iflag &= ~(IXON | IXOFF | IXANY);
+
+	// Raw mode
+	tty.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
+	tty.c_oflag &= ~OPOST;
+
+	// Set timeouts
+	tty.c_cc[VMIN] = 0;
+	tty.c_cc[VTIME] = 1;
+
+	tcsetattr(ps.serial_fd, TCSANOW, &tty);
+
+	// Wait for power supply to stabilize
+	usleep(100000);
+
+	// Set voltage and current with proper Korad commands
+	char cmd[64];
+
+	// Set voltage
+	snprintf(cmd, sizeof(cmd), "VSET1:%.2f", voltage);
+	write(ps.serial_fd, cmd, strlen(cmd));
+	usleep(100000);
+
+	// Set current
+	snprintf(cmd, sizeof(cmd), "ISET1:%.3f", current);
+	write(ps.serial_fd, cmd, strlen(cmd));
+	usleep(100000);
+
+	// Turn output off initially
+	write(ps.serial_fd, "OUT0", 4);
+	usleep(100000);
+
+	ps.voltage = voltage;
+	ps.current = current;
+	strcpy(ps.current_state, "OFF");
+
+	printf("Power supply initialized: %.1fV, %.3fA\n", voltage, current);
+	return 0;
+}
+
+void start_modulation(double frequency) {
+	ps.frequency = frequency;
+	ps.modulation_active = 1;
+	ps.cycle_count = 0;
+	gettimeofday(&ps.start_time, NULL);
+
+	printf("Starting modulation: %.2f Hz\n", frequency);
+
+	// Start modulation thread
+	pthread_t mod_thread;
+	pthread_create(&mod_thread, NULL, modulation_thread, NULL);
+	pthread_detach(mod_thread);
+}
+
+void* modulation_thread(void* arg) {
+	double period = 1.0 / ps.frequency;
+	double on_time = period * 0.5;  // 50% duty cycle
+	double off_time = period * 0.5;
+
+	int cycle = 0;
+	while (ps.modulation_active && acquisition_running) {
+		// Turn ON
+		int bytes_written = write(ps.serial_fd, "OUT1", 4);
+		if (bytes_written >= 0) {
+			strcpy(ps.current_state, "ON");
+			ps.cycle_count = cycle;
+		}
+
+		usleep((int)(on_time * 1000000));
+
+		if (!ps.modulation_active || !acquisition_running) break;
+
+		// Turn OFF
+		bytes_written = write(ps.serial_fd, "OUT0", 4);
+		if (bytes_written >= 0) {
+			strcpy(ps.current_state, "OFF");
+		}
+
+		cycle++;
+		usleep((int)(off_time * 1000000));
+	}
+
+	// Ensure output is off when stopping
+	write(ps.serial_fd, "OUT0", 4);
+	strcpy(ps.current_state, "OFF");
+
+	return NULL;
+}
+
+void get_current_power_state(char *state_str, int *cycle_num) {
+	if (!ps.modulation_active) {
+		strcpy(state_str, "OFF");
+		*cycle_num = 0;
+		return;
+	}
+
+	strcpy(state_str, ps.current_state);
+	*cycle_num = ps.cycle_count;
+}
+
+void cleanup_and_exit(int sig) {
+	printf("\nShutting down...\n");
+	acquisition_running = 0;
+	ps.modulation_active = 0;
+
+	// Power supply cleanup first
+	if (ps.serial_fd >= 0) {
+		write(ps.serial_fd, "OUT0", 4);
+		close(ps.serial_fd);
+	}
+
+	// Copy files if output directory specified
+	if (strlen(output_dir) > 0) {
+		printf("Copying files from RAMDisk to %s...\n", output_dir);
+		char cmd[512];
+
+		snprintf(cmd, sizeof(cmd), "mkdir -p '%s'", output_dir);
+		system(cmd);
+
+		snprintf(cmd, sizeof(cmd), "cp %sthermal_gray_*.pgm '%s/' 2>/dev/null || true", 
+				RAMDISKPATH, output_dir);
+		system(cmd);
+
+		snprintf(cmd, sizeof(cmd), "ls -1 '%s'/thermal_gray_*.pgm 2>/dev/null | wc -l", output_dir);
+		FILE *fp = popen(cmd, "r");
+		if (fp) {
+			char count_str[32];
+			if (fgets(count_str, sizeof(count_str), fp)) {
+				int copied_count = atoi(count_str);
+				printf("Copied %d files to %s\n", copied_count, output_dir);
+			}
+			pclose(fp);
+		}
+	}
+
+	printf("Acquisition complete: %d frames captured\n", filecount);
+
+	// USB cleanup
+	if (devh) {
+		for (int i = 0; i <= 2; i++) {
+			libusb_release_interface(devh, i);
+		}
+		libusb_close(devh);
+		devh = NULL;
+	}
+
+	exit(0);
+}
+
+// RAW 16-BIT THERMAL DATA VERSION - Preserves full bit depth for scientific analysis
+void vframe(char ep[], char EP_error[], int r, int actual_length, unsigned char buf[]) {
 	time_t now1;
-	now1 = time(NULL); 
+	now1 = time(NULL);
+
 	if (r < 0) {
-		if (strcmp (EP_error, libusb_error_name(r))!=0)
-		{       
+		if (strcmp(EP_error, libusb_error_name(r)) != 0) {
 			strcpy(EP_error, libusb_error_name(r));
-			fprintf(stderr, "\n: %s >>>>>>>>>>>>>>>>>bulk transfer (in) %s:%i %s\n", ctime(&now1), ep , r, libusb_error_name(r));
+			fprintf(stderr, "\n: %s >>>>>>>>>>>>>>>>>bulk transfer (in) %s:%i %s\n", 
+					ctime(&now1), ep, r, libusb_error_name(r));
 			sleep(1);
 		}
 		return;
 	}
 
-	// reset buffer if the new chunk begins with magic bytes or the buffer size limit is exceeded
-	unsigned char magicbyte[4]={0xEF,0xBE,0x00,0x00};
+	// Reset buffer if new chunk begins with magic bytes or buffer overflow
+	unsigned char magicbyte[4] = {0xEF, 0xBE, 0x00, 0x00};
 
-	if  ((strncmp (buf, magicbyte,4)==0 ) || ((buf85pointer + actual_length) >= BUF85SIZE))
-	{
-		// printf(">>>>>>>>>>>begin of new frame<<<<<<<<<<<<<\n");
-		buf85pointer=0;
+	if ((strncmp((char*)buf, (char*)magicbyte, 4) == 0) || ((buf85pointer + actual_length) >= 1048576)) {
+		buf85pointer = 0;
 	}
 
-	//printf("actual_length %d !!!!!\n", actual_length);
+	memmove(buf85 + buf85pointer, buf, actual_length);
+	buf85pointer = buf85pointer + actual_length;
 
-	memmove(buf85+buf85pointer, buf, actual_length);
-	buf85pointer=buf85pointer+actual_length;
-
-	if  ((strncmp (buf85, magicbyte,4)!=0 ))
-	{
-		//reset buff pointer
-		buf85pointer=0;
-		printf("Reset buffer because of bad Magic Byte!\n");
+	if (strncmp((char*)buf85, (char*)magicbyte, 4) != 0) {
+		buf85pointer = 0;
 		return;
 	}
 
-	// a quick and dirty job for gcc
-	uint32_t FrameSize   = buf85[ 8] + (buf85[ 9] << 8) + (buf85[10] << 16) + (buf85[11] << 24);
+	// Parse frame header
+	uint32_t FrameSize = buf85[8] + (buf85[9] << 8) + (buf85[10] << 16) + (buf85[11] << 24);
 	uint32_t ThermalSize = buf85[12] + (buf85[13] << 8) + (buf85[14] << 16) + (buf85[15] << 24);
-	uint32_t JpgSize     = buf85[16] + (buf85[17] << 8) + (buf85[18] << 16) + (buf85[19] << 24);
-	uint32_t StatusSize  = buf85[20] + (buf85[21] << 8) + (buf85[22] << 16) + (buf85[23] << 24);
+	uint32_t JpgSize = buf85[16] + (buf85[17] << 8) + (buf85[18] << 16) + (buf85[19] << 24);
+	uint32_t StatusSize = buf85[20] + (buf85[21] << 8) + (buf85[22] << 16) + (buf85[23] << 24);
 
-	//printf("FrameSize= %d (+28=%d), ThermalSize %d, JPG %d, StatusSize %d, Pointer %d\n",FrameSize,FrameSize+28, ThermalSize, JpgSize,StatusSize,buf85pointer); 
-
-	if ( (FrameSize+28) > (buf85pointer) ) 
-	{
-		// wait for next chunk
-		return;
+	if ((FrameSize + 28) > buf85pointer) {
+		return; // Wait for more data
 	}
 
-	int i,v;
-	// get a full frame, first print the status
-	t1=t2;
+	// Frame timing
+	t1 = t2;
 	gettimeofday(&t2, NULL);
-	// fps as moving average over last 20 frames
-	fps_t = (19*fps_t+10000000/(((t2.tv_sec * 1000000) + t2.tv_usec) - ((t1.tv_sec * 1000000) + t1.tv_usec)))/20;
+	fps_t = (19 * fps_t + 10000000 / (((t2.tv_sec * 1000000) + t2.tv_usec) - 
+				((t1.tv_sec * 1000000) + t1.tv_usec))) / 20;
 
-	
 	filecount++;
-	file_index = (file_index + 1) % MAX_FILES;
-	
-	printf("#%06i %lld/10 fps:",filecount,fps_t); 
-	for (i = 0; i <  StatusSize; i++) {
-		v=28+ThermalSize+JpgSize+i;
-		if(buf85[v]>31) {printf("%c", buf85[v]);}
+
+	// Get power state
+	char power_state[16];
+	int cycle_number;
+	get_current_power_state(power_state, &cycle_number);
+
+	// Calculate relative time since modulation start
+	double relative_time = 0.0;
+	if (ps.modulation_active) {
+		relative_time = (t2.tv_sec - ps.start_time.tv_sec) + 
+			(t2.tv_usec - ps.start_time.tv_usec) / 1000000.0;
 	}
-	printf("\n"); 
 
-	buf85pointer=0;
+	// Print progress
+	printf("#%06i %lld/10 fps, Power: %s, Cycle: %03d, T+%.3fs:", 
+			filecount, fps_t, power_state, cycle_number, relative_time);
+	for (int i = 0; i < StatusSize; i++) {
+		int v = 28 + ThermalSize + JpgSize + i;
+		if (buf85[v] > 31) {
+			printf("%c", buf85[v]);
+		}
+	}
+	printf("\n");
 
-	unsigned short pix[160*120];
-	int x, y;
-	unsigned char *fb_proc,*fb_proc2; 
-	fb_proc = malloc(160 * 120);       // 8 Bit gray buffer really needs only 160 x 120
-	fb_proc2 = malloc(160 * 120 * 3 ); // 8x8x8  Bit RGB buffer 
+	buf85pointer = 0;
 
-	int min = 0x10000, max = 0;
-	float rms = 0;
+	// Allocate memory for the 16-bit raw pixel data
+	unsigned short pix[160 * 120];
 
-	// Make a unsigned short array from what comes from the thermal frame
-	for (y = 0; y < 120; ++y) 
-	{
-		for (x = 0; x < 160; ++x) {
-			if (x<80) 
-				v = buf85[2*(y * 164 + x) +32]+256*buf85[2*(y * 164 + x) +33];
-			else
-				v = buf85[2*(y * 164 + x) +32+4]+256*buf85[2*(y * 164 + x) +33+4];   
-			pix[y * 160 + x] = v;   // unsigned char!!
+	// Extract raw 16-bit thermal data
+	for (int y = 0; y < 120; ++y) {
+		for (int x = 0; x < 160; ++x) {
+			int offset;
+			if (x < 80) {
+				offset = 2 * (y * 164 + x) + 32;
+			} else {
+				offset = 2 * (y * 164 + x) + 32 + 4;
+			}
+			pix[y * 160 + x] = buf85[offset] + (buf85[offset + 1] << 8);
 		}
 	}
 
-	// find the max, min and RMS (not used yet) values of the array
-	int maxx, maxy;
-	for (i = 0; i < 160 * 120; ++i) {
+	// Find min/max values from the raw data
+	unsigned short min = 0xFFFF, max = 0;
+	for (int i = 0; i < 160 * 120; ++i) {
 		if (pix[i] < min) min = pix[i];
-		if (pix[i] > max) { max = pix[i]; maxx = i % 320; maxy = i / 320; }
-		rms += pix[i] * pix[i];
+		if (pix[i] > max) max = pix[i];
 	}
 
-	// RMS used later
-	rms /= 160 * 120;
-	rms = sqrtf(rms);
-
-	// scale the data in the array
-	int delta = max - min;
-	if (!delta) delta = 1;
-
-	//  int scale = 0x10000 / (max - min); // if max = min we have divide by zero
-	int scale = 0x10000 / delta;
-
-	for (y = 0; y < 120; ++y) 
-	{
-		for (x = 0; x < 160; ++x) {
-			int v = (pix[y * 160 + x] - min) * scale >> 8;
-
-			// fb_proc is the gray scale frame buffer
-			fb_proc[y * 160 + x] = v;   // unsigned char!!
-
-			// fb_proc2 is an 24bit RGB buffer
-			const int *colormap = colormap_ironblack;    
-			fb_proc2[3*y * 160 + x*3] = colormap[3 * v];   // unsigned char!!
-			fb_proc2[(3*y * 160 + x*3)+1] = colormap[3 * v + 1];   // unsigned char!!
-			fb_proc2[(3*y * 160 + x*3)+2] = colormap[3 * v + 2];   // unsigned char!!
-
+	// Save the raw 16-bit PGM file
+	char filename[200];
+	sprintf(filename, RAMDISKPATH "thermal_gray_%06d.pgm", filecount);
+	FILE *outfile = fopen(filename, "wb");
+	if (outfile) {
+		// PGM Header
+		fprintf(outfile, "P5\n");
+		fprintf(outfile, "# frame_number: %06i\n", filecount);
+		fprintf(outfile, "# timestamp: %ld\n", t2.tv_sec);
+		fprintf(outfile, "# timestamp_usec: %ld\n", t2.tv_usec);
+		fprintf(outfile, "# power_state: %s\n", power_state);
+		fprintf(outfile, "# cycle_number: %d\n", cycle_number);
+		fprintf(outfile, "# relative_time: %.6f\n", relative_time);
+		fprintf(outfile, "# modulation_freq: %.3f\n", ps.frequency);
+		fprintf(outfile, "# voltage: %.3f\n", ps.voltage);
+		fprintf(outfile, "# current: %.3f\n", ps.current);
+		fprintf(outfile, "# min_temp_raw: %u\n", min);
+		fprintf(outfile, "# max_temp_raw: %u\n", max);
+		fprintf(outfile, "# status: ");
+		for (int i = 0; i < StatusSize; i++) {
+			int v = 28 + ThermalSize + JpgSize + i;
+			if (buf85[v] > 31) {
+				fprintf(outfile, "%c", buf85[v]);
+			}
 		}
-	}
+		fprintf(outfile, "\n");
 
-	char filename[100];
-	FILE *outfile;
-
-	// write real image to disc
-	sprintf(filename, RAMDISKPATH"real.jpg");
-	if ((outfile = fopen(filename, "wb")) == NULL) {
-		fprintf(stderr, "can't open %s\n", filename);
-		exit(1);
-	}
-	fwrite(&buf85[28+ThermalSize], 1, JpgSize, outfile);
-	fclose(outfile);  
-
-	// write thermal frame as jpg to disc   
-	// see https://github.com/LuaDist/libjpeg/blob/master/example.c
-	// freeze thermal image if "shutterState"="FFC"
-	if (strncmp (&buf85[28+ThermalSize+JpgSize+17],"FFC",3)!=0)
-	{        
-		struct jpeg_compress_struct cinfo;
-		struct jpeg_error_mgr jerr;
-
-		int image_height=120;	/* Number of rows in image */
-		int image_width=160;	/* Number of columns in image */
-		int quality=90;
-
-		JSAMPROW row_pointer[1];	/* pointer to JSAMPLE row[s] */
-		int row_stride;		/* physical row width in image buffer */
-
-		cinfo.err = jpeg_std_error(&jerr);
-		jpeg_create_compress(&cinfo);
-
-		sprintf(filename, RAMDISKPATH"thermal.jpg");
-		if ((outfile = fopen(filename, "wb")) == NULL) {
-			fprintf(stderr, "can't open %s\n", filename);
-			exit(1);
-		}
-		jpeg_stdio_dest(&cinfo, outfile);
-
-		cinfo.image_width = image_width; 	/* image width and height, in pixels */
-		cinfo.image_height = image_height;
-		cinfo.input_components = 3;		/* # of color components per pixel */
-		cinfo.in_color_space = JCS_RGB; 	/* colorspace of input image */
-		jpeg_set_defaults(&cinfo);
-
-		jpeg_set_quality(&cinfo, quality, TRUE /* limit to baseline-JPEG values */);
-
-		// cinfo.write_JFIF_header = FALSE;     // remove JFIF_header when needed
-		jpeg_start_compress(&cinfo, TRUE);
-		row_stride = image_width * 3;	/* JSAMPLEs per row in image_buffer */
-
-		while (cinfo.next_scanline < cinfo.image_height) {
-			row_pointer[0] = & fb_proc2[cinfo.next_scanline * row_stride];
-			(void) jpeg_write_scanlines(&cinfo, row_pointer, 1);
-		}
-
-		jpeg_finish_compress(&cinfo);
+		fprintf(outfile, "160 120\n65535\n");
+		fwrite(pix, sizeof(unsigned short), 160 * 120, outfile);
 		fclose(outfile);
-
-		// free memory
-		jpeg_destroy_compress(&cinfo);    // thermal jpg   
 	}
-
-	// Save as PGM (grayscale) with metadata
-	sprintf(filename, RAMDISKPATH"thermal_gray_%03i.pgm", file_index);
-	if ((outfile = fopen(filename, "wb")) == NULL) {
-		fprintf(stderr, "can't open %s\n", filename);
-		exit(1);
-	}
-	fprintf(outfile, "P5\n");
-	fprintf(outfile, "# frame_number: %06i\n", filecount);
-	fprintf(outfile, "# fps_x10: %lld\n", fps_t);
-	fprintf(outfile, "# timestamp: %ld\n", t2.tv_sec);
-	fprintf(outfile, "# timestamp_usec: %ld\n", t2.tv_usec);
-	fprintf(outfile, "# min_temp: %d\n", min);
-	fprintf(outfile, "# max_temp: %d\n", max);
-	fprintf(outfile, "# status: ");
-	for (i = 0; i < StatusSize; i++) {
-		v = 28 + ThermalSize + JpgSize + i;
-		if(buf85[v] > 31) {
-			fprintf(outfile, "%c", buf85[v]);
-		}
-	}
-	fprintf(outfile, "\n");
-	fprintf(outfile, "160 120\n255\n");
-	fwrite(fb_proc, 1, 160 * 120, outfile);
-	fclose(outfile);
-
-	// Save as PPM (RGB) with metadata
-	sprintf(filename, RAMDISKPATH"thermal_rgb_%03i.ppm", file_index);
-	if ((outfile = fopen(filename, "wb")) == NULL) {
-		fprintf(stderr, "can't open %s\n", filename);
-		exit(1);
-	}
-	fprintf(outfile, "P6\n");
-	fprintf(outfile, "# frame_number: %06i\n", filecount);
-	fprintf(outfile, "# fps_x10: %lld\n", fps_t);
-	fprintf(outfile, "# timestamp: %ld\n", t2.tv_sec);
-	fprintf(outfile, "# timestamp_usec: %ld\n", t2.tv_usec);
-	fprintf(outfile, "# min_temp: %d\n", min);
-	fprintf(outfile, "# max_temp: %d\n", max);
-	fprintf(outfile, "# status: ");
-	for (i = 0; i < StatusSize; i++) {
-		v = 28 + ThermalSize + JpgSize + i;
-		if(buf85[v] > 31) {
-			fprintf(outfile, "%c", buf85[v]);
-		}
-	}
-	fprintf(outfile, "\n");
-	fprintf(outfile, "160 120\n255\n");
-	fwrite(fb_proc2, 1, 160 * 120 * 3, outfile);
-	fclose(outfile);
-	free(fb_proc);                    // thermal RAW
-	free(fb_proc2);                   // visible jpg
-
-
 }
 
-static int find_lvr_flirusb(void)
-{
+static int find_lvr_flirusb(void) {
 	devh = libusb_open_device_with_vid_pid(NULL, VENDOR_ID, PRODUCT_ID);
 	return devh ? 0 : -EIO;
 }
 
-void print_bulk_result(char ep[],char EP_error[], int r, int actual_length, unsigned char buf[])
-{
-	time_t now1;
-	int i;
-
-	now1 = time(NULL);
+void print_bulk_result(char ep[], char EP_error[], int r, int actual_length, unsigned char buf[]) {
 	if (r < 0) {
-		if (strcmp (EP_error, libusb_error_name(r))!=0)
-		{       
+		if (strcmp(EP_error, libusb_error_name(r)) != 0) {
 			strcpy(EP_error, libusb_error_name(r));
-			fprintf(stderr, "\n: %s >>>>>>>>>>>>>>>>>bulk transfer (in) %s:%i %s\n", ctime(&now1), ep , r, libusb_error_name(r));
+			time_t now1 = time(NULL);
+			fprintf(stderr, "\n: %s >>>>>>>>>>>>>>>>>bulk transfer (in) %s:%i %s\n", 
+					ctime(&now1), ep, r, libusb_error_name(r));
 			sleep(1);
 		}
-		//return 1;
-	} else
-	{           
-		printf("\n: %s bulk read EP %s, actual length %d\nHEX:\n",ctime(&now1), ep ,actual_length);
-		// write frame to file          
-		/*
-		   char filename[100];
-		   sprintf(filename, "EP%s#%05i.bin",ep,filecount);
-		   filecount++;
-		   FILE *file = fopen(filename, "wb");
-		   fwrite(buf, 1, actual_length, file);
-		   fclose(file);
-		   */         
-		// hex print of first byte
-		for (i = 0; i <  (((200)<(actual_length))?(200):(actual_length)); i++) {
-			printf(" %02x", buf[i]);
-		}
+	}
+}
 
-		printf("\nSTRING:\n");	
-		for (i = 0; i <  (((200)<(actual_length))?(200):(actual_length)); i++) {
-			if(buf[i]>31) {printf("%c", buf[i]);}
-		}
-		printf("\n");	
-
-	} 
-}       
-
-
-int EPloop(void)
-{      
-	int i,r = 1;
-	r = libusb_init(NULL);
+int EPloop(void) {
+	int r = libusb_init(NULL);
 	if (r < 0) {
-		fprintf(stderr, "failed to initialise libusb\n");
+		fprintf(stderr, "Failed to initialise libusb\n");
 		exit(1);
 	}
 
 	r = find_lvr_flirusb();
 	if (r < 0) {
-		fprintf(stderr, "Could not find/open device\n");
+		fprintf(stderr, "Could not find/open FLIR device\n");
 		goto out;
 	}
-	printf("Successfully find the Flir One G2 device\n");
-
+	printf("Found FLIR One G2 device\n");
 
 	r = libusb_set_configuration(devh, 3);
 	if (r < 0) {
 		fprintf(stderr, "libusb_set_configuration error %d\n", r);
 		goto out;
 	}
-	printf("Successfully set usb configuration 3\n");
 
-
-	// Claiming of interfaces is a purely logical operation; 
-	// it does not cause any requests to be sent over the bus. 
-	r = libusb_claim_interface(devh, 0);
-	if (r <0) {
-		fprintf(stderr, "libusb_claim_interface 0 error %d\n", r);
-		goto out;
-	}	
-	r = libusb_claim_interface(devh, 1);
-	if (r < 0) {
-		fprintf(stderr, "libusb_claim_interface 1 error %d\n", r);
-		goto out;
+	// Claim interfaces
+	for (int i = 0; i <= 2; i++) {
+		r = libusb_claim_interface(devh, i);
+		if (r < 0) {
+			fprintf(stderr, "libusb_claim_interface %d error %d\n", i, r);
+			goto out;
+		}
 	}
-	r = libusb_claim_interface(devh, 2);
-	if (r < 0) {
-		fprintf(stderr, "libusb_claim_interface 2 error %d\n", r);
-		goto out;
-	}
-	printf("Successfully claimed interface 0,1,2\n");
 
-
-	unsigned char buf[1048576]; 
+	unsigned char buf[1048576];
 	int actual_length;
+	char EP81_error[50] = "", EP83_error[50] = "", EP85_error[50] = "";
+	unsigned char data[2] = {0, 0};
+	int state = 1;
 
-	time_t now;
-	// save last error status to avoid clutter the log
-	char EP81_error[50]="", EP83_error[50]="",EP85_error[50]=""; 
-	unsigned char data[2]={0,0}; // only a bad dummy
-
-	int state = 1; 
-	int ct=0;
-
-	while (1)
-	{
-
-		switch(state) {
-
+	while (acquisition_running) {
+		switch (state) {
 			case 1:
-				/* Flir config
-				   01 0b 01 00 01 00 00 00 c4 d5
-				   0 bmRequestType = 01
-				   1 bRequest = 0b
-				   2 wValue 0001 type (H) index (L)    stop=0/start=1 (Alternate Setting)
-				   4 wIndex 01                         interface 1/2
-				   5 wLength 00
-				   6 Data 00 00
-
-				   libusb_control_transfer (*dev_handle, bmRequestType, bRequest, wValue,  wIndex, *data, wLength, timeout)
-				   */
-
-				printf("stop interface 2 FRAME\n");
-				r = libusb_control_transfer(devh,1,0x0b,0,2,data,0,100);
-				if (r < 0) {
-					fprintf(stderr, "Control Out error %d\n", r);
-					return r;
-				}
-
-				printf("stop interface 1 FILEIO\n");
-				r = libusb_control_transfer(devh,1,0x0b,0,1,data,0,100);
-				if (r < 0) {
-					fprintf(stderr, "Control Out error %d\n", r);
-					return r;
-				} 
-
-				printf("\nstart interface 1 FILEIO\n");
-				r = libusb_control_transfer(devh,1,0x0b,1,1,data,0,100);
-				if (r < 0) {
-					fprintf(stderr, "Control Out error %d\n", r);
-					return r;
-				}
-				now = time(0); // Get the system time
-				printf("\n:xx %s",ctime(&now));
-				state = 2;   // jump over wait stait 2
+				libusb_control_transfer(devh, 1, 0x0b, 0, 2, data, 0, 100);
+				libusb_control_transfer(devh, 1, 0x0b, 0, 1, data, 0, 100);
+				libusb_control_transfer(devh, 1, 0x0b, 1, 1, data, 0, 100);
+				state = 2;
 				break;
-
 
 			case 2:
-				printf("\nask for CameraFiles.zip on EP 0x83:\n");     
-				now = time(0); // Get the system time
-				printf("\n: %s",ctime(&now));
+				// Send configuration commands
+				unsigned char cmd1[16] = {0xcc,0x01,0x00,0x00,0x01,0x00,0x00,0x00,0x41,0x00,0x00,0x00,0xF8,0xB3,0xF7,0x00};
+				libusb_bulk_transfer(devh, 2, cmd1, 16, &actual_length, 0);
 
-				int transferred = 0;
-				char my_string[128];
+				char json_cmd[] = "{\"type\":\"openFile\",\"data\":{\"mode\":\"r\",\"path\":\"CameraFiles.zip\"}}";
+				libusb_bulk_transfer(devh, 2, (unsigned char*)json_cmd, strlen(json_cmd)+1, &actual_length, 0);
 
-				//--------- write string: {"type":"openFile","data":{"mode":"r","path":"CameraFiles.zip"}}
-				int length = 16;
-				unsigned char my_string2[16]={0xcc,0x01,0x00,0x00,0x01,0x00,0x00,0x00,0x41,0x00,0x00,0x00,0xF8,0xB3,0xF7,0x00};
-				printf("\nEP 0x02 to be sent Hexcode: %i Bytes[",length);
-				int i;
-				for (i = 0; i < length; i++) {
-					printf(" %02x", my_string2[i]);
+				unsigned char cmd2[16] = {0xcc,0x01,0x00,0x00,0x01,0x00,0x00,0x00,0x33,0x00,0x00,0x00,0xef,0xdb,0xc1,0xc1};
+				libusb_bulk_transfer(devh, 2, cmd2, 16, &actual_length, 0);
 
-				}
-				printf(" ]\n");
+				char json_cmd2[] = "{\"type\":\"readFile\",\"data\":{\"streamIdentifier\":10}}";
+				libusb_bulk_transfer(devh, 2, (unsigned char*)json_cmd2, strlen(json_cmd2)+1, &actual_length, 0);
 
-				r = libusb_bulk_transfer(devh, 2, my_string2, length, &transferred, 0);
-				if(r == 0 && transferred == length)
-				{
-					printf("\nWrite successful!");
-				}
-				else
-					printf("\nError in write! res = %d and transferred = %d\n", r, transferred);
-
-				strcpy(  my_string,"{\"type\":\"openFile\",\"data\":{\"mode\":\"r\",\"path\":\"CameraFiles.zip\"}}");
-
-				length = strlen(my_string)+1;
-				printf("\nEP 0x02 to be sent: %s", my_string);
-
-				// avoid error: invalid conversion from ‘char*’ to ‘unsigned char*’ [-fpermissive]
-				unsigned char *my_string1 = (unsigned char*)my_string;
-				//my_string1 = (unsigned char*)my_string;
-
-				r = libusb_bulk_transfer(devh, 2, my_string1, length, &transferred, 0);
-				if(r == 0 && transferred == length)
-				{
-					printf("\nWrite successful!");
-					printf("\nSent %d bytes with string: %s\n", transferred, my_string);
-				}
-				else
-					printf("\nError in write! res = %d and transferred = %d\n", r, transferred);
-
-				//--------- write string: {"type":"readFile","data":{"streamIdentifier":10}}
-				length = 16;
-				unsigned char my_string3[16]={0xcc,0x01,0x00,0x00,0x01,0x00,0x00,0x00,0x33,0x00,0x00,0x00,0xef,0xdb,0xc1,0xc1};
-				printf("\nEP 0x02 to be sent Hexcode: %i Bytes[",length);
-				for (i = 0; i < length; i++) {
-					printf(" %02x", my_string3[i]);
-
-				}
-				printf(" ]\n");
-
-				r = libusb_bulk_transfer(devh, 2, my_string3, length, &transferred, 0);
-				if(r == 0 && transferred == length)
-				{
-					printf("\nWrite successful!");
-				}
-				else
-					printf("\nError in write! res = %d and transferred = %d\n", r, transferred);
-
-
-				//strcpy(  my_string, "{\"type\":\"setOption\",\"data\":{\"option\":\"autoFFC\",\"value\":true}}");
-				strcpy(  my_string,"{\"type\":\"readFile\",\"data\":{\"streamIdentifier\":10}}");
-				length = strlen(my_string)+1;
-				printf("\nEP 0x02 to be sent %i Bytes: %s", length, my_string);
-
-				// avoid error: invalid conversion from ‘char*’ to ‘unsigned char*’ [-fpermissive]
-				my_string1 = (unsigned char*)my_string;
-
-				r = libusb_bulk_transfer(devh, 2, my_string1, length, &transferred, 0);
-				if(r == 0 && transferred == length)
-				{
-					printf("\nWrite successful!");
-					printf("\nSent %d bytes with string: %s\n", transferred, my_string);
-				}
-				else
-					printf("\nError in write! res = %d and transferred = %d\n", r, transferred);
-
-
-				// go to next state
-				now = time(0); // Get the system time
-				printf("\n: %s",ctime(&now));
-				//sleep(1);
-				state = 3;           
+				state = 3;
 				break;
 
-
 			case 3:
-				printf("\nAsk for video stream, start EP 0x85:\n");        
-
-				r = libusb_control_transfer(devh,1,0x0b,1,2,data, 2,200);
-				if (r < 0) {
-					fprintf(stderr, "Control Out error %d\n", r);
-					return r;
-				};
-
+				libusb_control_transfer(devh, 1, 0x0b, 1, 2, data, 2, 200);
 				state = 4;
 				break;
 
 			case 4:
-				// endless loop 
-				// poll Frame Endpoints 0x85 
-				// don't change timeout=100ms !!
-				r = libusb_bulk_transfer(devh, 0x85, buf, sizeof(buf), &actual_length, 100); 
-				if (actual_length > 0)
-					vframe("0x85",EP85_error, r, actual_length, buf);
+				// Main acquisition loop
+				r = libusb_bulk_transfer(devh, 0x85, buf, sizeof(buf), &actual_length, 100);
+				if (actual_length > 0) {
+					vframe("0x85", EP85_error, r, actual_length, buf);
+				}
+				break;
+		}
 
-				break;      
+		// Poll other endpoints
+		libusb_bulk_transfer(devh, 0x81, buf, sizeof(buf), &actual_length, 10);
+		print_bulk_result("0x81", EP81_error, r, actual_length, buf);
 
-		}    
-
-		// poll Endpoints 0x81, 0x83
-		r = libusb_bulk_transfer(devh, 0x81, buf, sizeof(buf), &actual_length, 10); 
-		print_bulk_result("0x81",EP81_error, r, actual_length, buf);
-
-		r = libusb_bulk_transfer(devh, 0x83, buf, sizeof(buf), &actual_length, 10);  
-		if (strcmp(libusb_error_name(r), "LIBUSB_ERROR_NO_DEVICE")==0) {
+		r = libusb_bulk_transfer(devh, 0x83, buf, sizeof(buf), &actual_length, 10);
+		if (strcmp(libusb_error_name(r), "LIBUSB_ERROR_NO_DEVICE") == 0) {
 			fprintf(stderr, "EP 0x83 LIBUSB_ERROR_NO_DEVICE -> reset USB\n");
 			goto out;
 		}
-
-		print_bulk_result("0x83",EP83_error, r, actual_length, buf); 
-
+		print_bulk_result("0x83", EP83_error, r, actual_length, buf);
 	}
 
-	// never reached ;-)
-	libusb_release_interface(devh, 0);
-
 out:
-	//close the device
-	libusb_reset_device(devh);
-	libusb_close(devh);
-	libusb_exit(NULL);
-	return r >= 0 ? r : -r;
-} 
+	if (devh) {
+		for (int i = 0; i <= 2; i++) {
+			libusb_release_interface(devh, i);
+		}
+		libusb_close(devh);
+		devh = NULL;
+	}
+	return 0;
+}
 
-int main(void)
-{
-	while (1)
-	{
+int main(int argc, char *argv[]) {
+	// Parse command line arguments
+	double frequency = 0.5;
+	double voltage = 5.0;
+	double current = 0.1;
+	int duration = 30;
+	char power_device[256] = "/dev/ttyACM0";
+
+	for (int i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "--freq") == 0 && i + 1 < argc) {
+			frequency = atof(argv[++i]);
+		} else if (strcmp(argv[i], "--voltage") == 0 && i + 1 < argc) {
+			voltage = atof(argv[++i]);
+		} else if (strcmp(argv[i], "--current") == 0 && i + 1 < argc) {
+			current = atof(argv[++i]);
+		} else if (strcmp(argv[i], "--duration") == 0 && i + 1 < argc) {
+			duration = atoi(argv[++i]);
+		} else if (strcmp(argv[i], "--device") == 0 && i + 1 < argc) {
+			strcpy(power_device, argv[++i]);
+		} else if (strcmp(argv[i], "--output") == 0 && i + 1 < argc) {
+			strcpy(output_dir, argv[++i]);
+		} else if (strcmp(argv[i], "--help") == 0) {
+			printf("RAW 16-BIT FLIR8K with Integrated Power Supply Control\n");
+			printf("======================================================\n");
+			printf("Usage: %s [options]\n", argv[0]);
+			printf("Options:\n");
+			printf("  --freq <Hz>       Modulation frequency (default: 0.5)\n");
+			printf("  --voltage <V>     Power supply voltage (default: 5.0)\n");
+			printf("  --current <A>     Current limit (default: 0.1)\n");
+			printf("  --duration <s>    Acquisition duration (default: 30)\n");
+			printf("  --device <path>   Power supply device (default: /dev/ttyACM0)\n");
+			printf("  --output <dir>    Copy files to directory when done\n");
+			printf("  --help           Show this help\n");
+			printf("\nSaves RAW 16-bit thermal data with synchronized power control\n");
+			return 0;
+		}
+	}
+
+	// Setup signal handlers
+	signal(SIGINT, cleanup_and_exit);
+	signal(SIGTERM, cleanup_and_exit);
+
+	printf("RAW 16-BIT FLIR8K with Integrated Power Supply Control\n");
+	printf("======================================================\n");
+	printf("Configuration:\n");
+	printf("  Modulation: %.2f Hz\n", frequency);
+	printf("  Voltage: %.1f V\n", voltage);
+	printf("  Current: %.3f A\n", current);
+	printf("  Duration: %d seconds\n", duration);
+	printf("  Power device: %s\n", power_device);
+	if (strlen(output_dir) > 0) {
+		printf("  Output directory: %s\n", output_dir);
+	}
+
+	// Check RAMDisk
+	if (access(RAMDISKPATH, F_OK) != 0) {
+		printf("RAMDisk not found at %s\n", RAMDISKPATH);
+		printf("Please create and mount RAMDisk:\n");
+		printf("  sudo mkdir -p %s\n", RAMDISKPATH);
+		printf("  sudo mount -t tmpfs -o size=50m none %s\n", RAMDISKPATH);
+		printf("  sudo chmod 777 %s\n", RAMDISKPATH);
+		return 1;
+	}
+
+	// Clear previous files
+	char cleanup_cmd[256];
+	snprintf(cleanup_cmd, sizeof(cleanup_cmd), "rm -f %s*.pgm %s*.jpg 2>/dev/null || true", RAMDISKPATH, RAMDISKPATH);
+	system(cleanup_cmd);
+
+	// Initialize power supply
+	if (init_power_supply(power_device, voltage, current) < 0) {
+		fprintf(stderr, "Failed to initialize power supply\n");
+		return 1;
+	}
+
+	// Reset frame counters
+	filecount = 0;
+	file_index = 0;
+
+	// Start modulation
+	start_modulation(frequency);
+
+	// Start acquisition
+	printf("Starting thermal acquisition...\n");
+
+	// Set acquisition duration alarm
+	if (duration > 0) {
+		alarm(duration);
+		signal(SIGALRM, cleanup_and_exit);
+	}
+
+	// Main acquisition loop
+	while (acquisition_running) {
 		EPloop();
-	}  
-}    
+	}
+
+	cleanup_and_exit(0);
+	return 0;
+}
